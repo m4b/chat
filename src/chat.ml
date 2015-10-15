@@ -191,7 +191,6 @@ let recv_fn sd saddr mutex running accs =
               match msg.kind with
               | ACC ->
                  begin
-                   Format.eprintf "@[<v 4>@ <WARN>:@.@]";
                    Mutex.lock mutex;
                    let sentmsg = Stack.pop accs in
                    Mutex.unlock mutex;
