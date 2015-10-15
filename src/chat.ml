@@ -1,7 +1,8 @@
 (* Compile with:
 ocamlbuild.native -tag thread -lib unix src/chat.native
 *)
-let version = "v1.0.1"
+let version = "v1.0.2"
+let kBUFFER_SIZE = 4096
 
 let debug = ref false
 
@@ -55,17 +56,25 @@ let resolve_hostname host port =
 
 (* a message has a kind, which is identified by a single byte at the beginning of a received or sent byte sequence
   Correct messages are either:
-    1. a sent message (\000 prefixed),
-    2. an acc of a sent message (\001 prefixed)
+    1. a sent message (\000 prefixed), followed by 8 bytes specifying the msg content size
+    2. an acc of a sent message (\001 prefixed), followed by 8 bytes specifizing the msg content size
   Incorrect messages are either bad (too small) or unknown, likely coming from a connection which does not implement this "protocol"
  *)
 
-type msg_kind = | SEND | ACC | BAD | Unknown of int
+(* NOTE on content size byte sequence.  
+   1. In a production system we'd use a Uleb128 for maximum space efficiency (variable width unsigned integer).
+   2. We're using OCaml's `int` (instead of int64) which actually uses the top bit for tagging; hence:
+     0x7fff_ffff_ffff_ffff is actually the largest representable int, which is also signed.
+     In practice, this is not very important, since it means our maximum message size representable 
+     is approximately 0x7fff_ffff_ffff_ffff/2/8 bytes ~ 500 petabytes, which is enough for our humble chat program.
+ *)
+
+type msg_kind = | SEND of int | ACC of int | BAD | Unknown of int
 
 let show_msg_kind kind =
   match kind with
-  | SEND -> "SEND"
-  | ACC -> "ACC"
+  | SEND length -> Printf.sprintf "SEND[%d]" length
+  | ACC length -> Printf.sprintf "ACC[%d]" length
   | BAD -> "BAD"
   | Unknown c -> Printf.sprintf "UNKNOWN 0x%x" c
 
@@ -85,40 +94,92 @@ let show_msg msg =
 let print_msg msg =
   pp_msg Format.std_formatter msg
 
+(* I stole these from rdr *)
+
+let set_uint bytes integer size offset = 
+  for i = 0 to (size - 1) do
+    let byte = Char.chr @@ ((integer lsr (8 * i)) land 0xff) in
+    Bytes.set bytes (i + offset) byte
+  done;
+  offset + size
+
+let u64o binary offset = 
+  let res = ref (Char.code @@ Bytes.get binary offset) in
+  for i = 1 to 7 do
+        res := !res lor (Char.code (Bytes.get binary (i + offset)) lsl (i * 8)); (* ugh-life *)
+  done;
+  !res,(8+offset)
+
 (* constructs a simple message with header/kind + contents from a byte sequence *)
 let msg_of_bytes bytes len =
-  if (len < 2) then
+  if (len < 10) then
     {kind=BAD; contents=bytes}
   else
+    let i64,offset = u64o bytes 1 in
     let kind =
       let k = Bytes.get bytes 0 |> Char.code in
       if (k = 0) then
-        SEND
+        SEND i64
       else if (k = 1) then
-        ACC
+        ACC i64
       else Unknown k
     in
-    let contents = Bytes.sub bytes 1 (len - 1) in
+    let contents = Bytes.sub bytes offset (len - offset) in
     {kind; contents}
 
 (* hand-crafted json, if real we'd use jsonm or another json lib, 
   in addition to avoiding ^ string concat, and also appending the acc byte sequence more appropriately *)
 let create_acc msg time =
-  "\001{acc: \"" ^ msg ^ "\", time: \"" ^ (string_of_float time) ^ "\"}"
+  let json = Printf.sprintf "{acc: \"%s\", time: \"%f\"}" msg time in
+  let length = Bytes.length json in
+  let header = Printf.sprintf "\001ffffffff" in
+  ignore @@ set_uint header length 8 1;
+  header ^ json
 
-(* similar to above, there is a better way of doing this
+(* similar to above, there is a _much_ better way of doing this
    (i.e., it's best to keep memory allocations as low as possible when sending),
    but suffices for simple demo *)
 let create_send msg =
-  let b = Bytes.make (Bytes.length msg + 1) '\000' in
-  Bytes.blit msg 0 b 1 (Bytes.length msg);
+  let length = Bytes.length msg in
+  let b = Bytes.make (length + 9) '\000' in
+  Bytes.blit msg 0 b 9 length;
+  ignore @@ set_uint b length 8 1;
   b
+
+(* *********************** *)
+(* Message Patching *)
+(* *********************** *)
+
+(* the type of message patch we're attempting to finish *)
+type patch_kind = | ACC | SEND
+
+(* Describes the state and information for patching a sequence of messages together *)
+type patch = {
+  kind: patch_kind;
+  mutable current: int;
+  total: int;
+  buffer: Buffer.t;
+}
+
+let create_patch kind ~current ~total ~msg =
+  let buffer = Buffer.create (kBUFFER_SIZE * 2) in
+  Buffer.add_bytes buffer msg;
+  {kind; current; total; buffer;}
+
+let empty_patch =
+    {kind = SEND; current = 0; total = 0; buffer = Buffer.create 0;}
+
+(* patches the current segment of a broken up message with the prior contents,
+   returns whether the patch is done, i.e. current >= total *)
+let patch_msg msg ~sd ~count ~patch =
+  patch.current <- patch.current + count;
+  if (!debug) then Format.printf "@[<v 4>@ PATCH %d/%d@.@]" patch.current patch.total;
+  Buffer.add_bytes patch.buffer msg;
+  patch.current >= patch.total
 
 (* *********************** *)
 (* Thread Logic *)
 (* *********************** *)
-
-let kBUFFER_SIZE = 4096
 
 (* consumes a message of arbitrary size, and 
    returns the count to the caller along 
@@ -158,6 +219,48 @@ let consume_msg sd buffer =
   else
     buffer,size
 
+(* sends a message in totality *)
+let send_msg sd msg =
+  let total = Bytes.length msg in
+  let count = Unix.send sd msg 0 (Bytes.length msg) [] in
+  if (!debug) then
+    Format.printf
+      "@[<v 4>@ SEND count %d@.@?@]" count;
+  if (count < total) then
+    let current = ref count in
+    while !current < total do
+      let pos,len = !current,((Bytes.length msg - !current)) in
+      let count = Unix.send sd msg pos len [] in
+      current := !current + count;
+      if (!debug) then
+        Format.printf
+          "@[<v 4>@ SEND %d/%d@.@?@]" !current total
+    done
+
+(* prints the acc wed received; checks sent message in the stack against acc value for debuggin *)
+let print_acc msg mutex accs =
+  Mutex.lock mutex;
+  let sentmsg = Stack.pop accs in
+  Mutex.unlock mutex;
+  if (!debug) then
+    begin
+      (* super hacky, again need proper json lib *)
+      try
+        let size = min (Bytes.length sentmsg) ((Bytes.length msg) - 7) in
+        let extract = Bytes.sub_string msg 7 size in
+        Format.printf "@[<v 4>@ ACC ROUNDTRIP PRESERVATION: %b@.@]"
+          (extract = sentmsg)
+      with _ -> Format.eprintf "@[<v 4>@ <WARN>: could not extract acc from msg %s@.@]" msg
+    end;
+  Format.printf "@[<v 2>@ << %s@.@]@[> @]@?" msg
+
+let send_acc sd msg current =
+  let time = Unix.gettimeofday () in
+  current := time -. !current;
+  Format.printf "@[@.< %s@.@]@[> @]@?" msg;
+  let acc = create_acc msg time in
+  send_msg sd acc
+
 (* this thread has two responsibilities:
    1. receives bytes and prints them to the console
    2. sends accs on message receipt
@@ -166,58 +269,62 @@ let consume_msg sd buffer =
 let recv_fn sd saddr mutex running accs =
   let id = Thread.self() |> Thread.id in
   if (!debug) then Format.printf "@[<v 4>@ Recv thread (%d) %s@.@?@]" id (show_saddr saddr);
-  let current = ref (Unix.gettimeofday ()) in
+  let current_time = ref (Unix.gettimeofday ()) in
   let buffer = Bytes.create kBUFFER_SIZE in
+  let patch = ref empty_patch in
+  let patching_message = ref false in
   let prompt = ">" in
   try
     while !running do
-      let ready = Thread.wait_timed_read sd 0.1 in
+      let ready = Thread.wait_timed_read sd 0.01 in
       if (ready) then
         begin
           let buffer,count = consume_msg sd buffer in
-          if (!debug) then Format.printf "@[<v 4>@ RECV count: %d msg: %s@.@?@]" count (Bytes.sub_string buffer 0 count);
+          if (!debug) then Format.printf "@[<v 4>@ RECV count: %d@.@?@]" count;
           if (count <= 0) then
             running := false
           else
-            begin
-              let msg = msg_of_bytes buffer count in
-              if (!debug) then
-                begin
-                  Format.printf "@[<v 4>@ MSG is %a@.@]" pp_msg msg;
-                  Format.printf "@[<v 4>@ COUNT %d@.@]" (Bytes.length msg.contents);
-                end;
-              let time = Unix.gettimeofday () in
-              current := time -. !current;
-              match msg.kind with
-              | ACC ->
-                 begin
-                   Mutex.lock mutex;
-                   let sentmsg = Stack.pop accs in
-                   Mutex.unlock mutex;
-                   if (!debug) then
-                     begin
-                       (* super hacky, again need proper json lib *)
-                       try
-                         let size = Bytes.length sentmsg in
-                         (*                          let size = min (Bytes.length sentmsg) ((Bytes.length msg.contents) - 7) in *)
-                         let extract = Bytes.sub_string msg.contents 7 size in
-                         Format.printf "@[<v 4>@ DBG: received acc \"%s\" from sent message \"%s\" with roundtrip preservation: %b@.@]"
-                                       extract sentmsg (extract = sentmsg)
-                       with _ -> Format.eprintf "@[<v 4>@ <WARN>: could not extract acc from msg %s@.@]" msg.contents
-                     end;
-                   Format.printf "@[<v 2>@ << %s@.@]@[%s @]@?" msg.contents prompt;
-                 end
-              | SEND ->
-                 begin
-                   Format.printf "@[@.< %s@.@]@[%s @]@?" msg.contents prompt;
-                   let acc = create_acc msg.contents time in
-                   ignore @@ Unix.send sd acc 0 (Bytes.length acc) []
-                 end
-              | BAD ->
-                 Format.eprintf "@[@.<WARN> Received bad message: %a@.@[%s @]@?@]" pp_msg msg prompt
-              | Unknown _ ->
-                 Format.eprintf "@[@.<WARN> Received unknown message kind: %a@.@[%s @]@?@]" pp_msg msg prompt
-            end
+            if (!patching_message) then
+              begin
+                if (patch_msg buffer ~sd:sd ~count:count ~patch:!patch) then
+                  match !patch.kind with
+                  | SEND ->
+                    begin
+                      if (!debug) then Format.printf "@[<v 4>@ PATCH SEND done %d/%d@.@]" !patch.current !patch.total;
+                      patching_message := false;
+                      send_acc sd (Buffer.to_bytes !patch.buffer) current_time
+                    end
+                  | ACC ->
+                    begin
+                      if (!debug) then Format.printf "@[<v 4>@ PATCH ACC done %d/%d@.@]" !patch.current !patch.total;
+                      patching_message := false;
+                      print_acc (Buffer.to_bytes !patch.buffer) mutex accs
+                    end
+              end
+            else
+              begin
+                let msg = msg_of_bytes buffer count in
+                if (!debug) then
+                  begin
+                    Format.printf "@[<v 4>@ MSG is %a@.@]" pp_msg msg;
+                    Format.printf "@[<v 4>@ COUNT contents %d@.@]" (Bytes.length msg.contents);
+                  end;
+                match msg.kind with
+                | ACC length ->
+                  if (count < length) then
+                    patch := create_patch ACC ~current:count ~total:length ~msg:buffer
+                  else
+                    print_acc msg.contents mutex accs
+                | SEND length ->
+                  if (count < length) then
+                    patch := create_patch SEND ~current:count ~total:length ~msg:buffer
+                  else
+                    send_acc sd msg.contents current_time
+                | BAD ->
+                  Format.eprintf "@[@.<WARN> Received bad message: %a@.@[%s @]@?@]" pp_msg msg prompt
+                | Unknown _ ->
+                  Format.eprintf "@[@.<WARN> Received unknown message kind: %a@.@[%s @]@?@]" pp_msg msg prompt
+              end
         end;
     done;
     running := false;
@@ -246,7 +353,8 @@ let send_fn sd saddr mutex running accs =
   try
     while !running do
       (* this lets us flip-flop from recv to send *)
-      let ready = Thread.wait_timed_read (Unix.descr_of_in_channel stdin) 0.1 in
+      (*       Format.printf "@[<v 4>@ THREAD SEND@.@]"; *)
+      let ready = Thread.wait_timed_read (Unix.descr_of_in_channel stdin) 0.01 in
       if (ready) then
         begin
           Format.printf "@[%s @]@?" prompt;
@@ -258,11 +366,7 @@ let send_fn sd saddr mutex running accs =
               Stack.push msg accs;
               Mutex.unlock mutex;
               let msg = create_send msg in
-              if (!debug) then
-                Format.printf
-                  "@[<v 4>@ SEND count %d@.@?@]"
-                  (Bytes.length msg);
-              ignore @@ Unix.send sd msg 0 (Bytes.length msg) [];
+              send_msg sd msg
             end;
           with End_of_file ->
             begin
