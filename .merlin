@@ -1,0 +1,9 @@
+PKG async
+PKG unix
+PKG thread
+PKG mutex
+
+B +thread
+B _build
+
+S src
