@@ -171,7 +171,7 @@ let empty_patch =
 
 (* patches the current segment of a broken up message with the prior contents,
    returns whether the patch is done, i.e. current >= total *)
-let patch_msg msg ~sd ~count ~patch =
+let patch_msg msg ~count ~patch =
   patch.current <- patch.current + count;
   if (!debug) then Format.printf "@[<v 4>@ PATCH %d/%d@.@]" patch.current patch.total;
   Buffer.add_bytes patch.buffer (Bytes.sub msg 0 count);
@@ -290,7 +290,7 @@ let recv_fn sd saddr mutex running accs =
             if (!patching_message) then
               begin
                 if (!debug) then Format.printf "@[<v 4>@ PATCHING MESSAGE@.@?@]";
-                if (patch_msg buffer ~sd:sd ~count:count ~patch:!patch) then
+                if (patch_msg buffer ~count:count ~patch:!patch) then
                   let msg = Bytes.sub (Buffer.to_bytes !patch.buffer) 0 !patch.total in
                   match !patch.kind with
                   | SEND ->
