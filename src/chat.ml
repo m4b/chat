@@ -1,6 +1,7 @@
 (* Compile with:
 ocamlbuild.native -tag thread -lib unix src/chat.native
 *)
+
 let version = "v1.0.2"
 let kBUFFER_SIZE = 4096
 
@@ -225,7 +226,7 @@ let send_msg sd msg =
   let count = Unix.send sd msg 0 (Bytes.length msg) [] in
   if (!debug) then
     Format.printf
-      "@[<v 4>@ SEND count %d@.@?@]" count;
+      "@[<v 4>@ SEND %d/%d@.@?@]" count total;
   if (count < total) then
     let current = ref count in
     while !current < total do
@@ -238,7 +239,7 @@ let send_msg sd msg =
     done
 
 (* prints the acc wed received; checks sent message in the stack against acc value for debuggin *)
-let print_acc msg mutex accs =
+let print_acc mutex accs msg =
   Mutex.lock mutex;
   let sentmsg = Stack.pop accs in
   Mutex.unlock mutex;
@@ -254,7 +255,7 @@ let print_acc msg mutex accs =
     end;
   Format.printf "@[<v 2>@ << %s@.@]@[> @]@?" msg
 
-let send_acc sd msg current =
+let send_acc sd current msg =
   let time = Unix.gettimeofday () in
   current := time -. !current;
   Format.printf "@[@.< %s@.@]@[> @]@?" msg;
@@ -286,20 +287,21 @@ let recv_fn sd saddr mutex running accs =
           else
             if (!patching_message) then
               begin
+                if (!debug) then Format.printf "@[<v 4>@ PATCHING MESSAGE@.@?@]";
                 if (patch_msg buffer ~sd:sd ~count:count ~patch:!patch) then
                   match !patch.kind with
                   | SEND ->
-                    begin
-                      if (!debug) then Format.printf "@[<v 4>@ PATCH SEND done %d/%d@.@]" !patch.current !patch.total;
-                      patching_message := false;
-                      send_acc sd (Buffer.to_bytes !patch.buffer) current_time
-                    end
+                     begin
+                       if (!debug) then Format.printf "@[<v 4>@ PATCH SEND done %d/%d@.@]" !patch.current !patch.total;
+                       patching_message := false;
+                       send_acc sd current_time (Buffer.to_bytes !patch.buffer)
+                     end
                   | ACC ->
-                    begin
-                      if (!debug) then Format.printf "@[<v 4>@ PATCH ACC done %d/%d@.@]" !patch.current !patch.total;
-                      patching_message := false;
-                      print_acc (Buffer.to_bytes !patch.buffer) mutex accs
-                    end
+                     begin
+                       if (!debug) then Format.printf "@[<v 4>@ PATCH ACC done %d/%d@.@]" !patch.current !patch.total;
+                       patching_message := false;
+                       print_acc mutex accs (Buffer.to_bytes !patch.buffer)
+                     end
               end
             else
               begin
@@ -311,32 +313,39 @@ let recv_fn sd saddr mutex running accs =
                   end;
                 match msg.kind with
                 | ACC length ->
-                  if (count < length) then
-                    patch := create_patch ACC ~current:count ~total:length ~msg:buffer
-                  else
-                    print_acc msg.contents mutex accs
+                   if (count < length) then
+                     begin
+                       patching_message := true;
+                       patch := create_patch ACC ~current:count ~total:length ~msg:msg.contents
+                     end
+                   else
+                     print_acc mutex accs msg.contents
                 | SEND length ->
-                  if (count < length) then
-                    patch := create_patch SEND ~current:count ~total:length ~msg:buffer
-                  else
-                    send_acc sd msg.contents current_time
+                   if (count < length) then
+                     begin
+                       patching_message := true;
+                       patch := create_patch SEND ~current:count ~total:length ~msg:msg.contents
+                     end
+                   else
+                     send_acc sd current_time msg.contents
                 | BAD ->
-                  Format.eprintf "@[@.<WARN> Received bad message: %a@.@[%s @]@?@]" pp_msg msg prompt
+                   Format.eprintf "@[@.<WARN> Received bad message: %a@.@[%s @]@?@]" pp_msg msg prompt
                 | Unknown _ ->
-                  Format.eprintf "@[@.<WARN> Received unknown message kind: %a@.@[%s @]@?@]" pp_msg msg prompt
+                   Format.eprintf "@[@.<WARN> Received unknown message kind: %a@.@[%s @]@?@]" pp_msg msg prompt
               end
         end;
     done;
     running := false;
     if (!debug) then Format.printf "@[<v 4>@ Thread exiting: %d @.@]" id;
     Thread.exit();
-  with exn ->
-    begin
-      running := false;
-      Format.eprintf "@[<v 4>@ RECV exc: %s@.@]" (Printexc.to_string exn);
-      Thread.exit();
-      raise exn
-    end
+  with
+  | exn ->
+     begin
+       running := false;
+       Format.eprintf "@[<v 4>@ RECV exc: %s@.@]" (Printexc.to_string exn);
+       Thread.exit();
+       raise exn
+     end
 
 (* 
    This send thread waits for user input, and then sends it.
@@ -359,15 +368,15 @@ let send_fn sd saddr mutex running accs =
         begin
           Format.printf "@[%s @]@?" prompt;
           try
-          let msg = read_line () in
-          if (Bytes.length msg > 0) then
-            begin
-              Mutex.lock mutex;
-              Stack.push msg accs;
-              Mutex.unlock mutex;
-              let msg = create_send msg in
-              send_msg sd msg
-            end;
+            let msg = read_line () in
+            if (Bytes.length msg > 0) then
+              begin
+                Mutex.lock mutex;
+                Stack.push msg accs;
+                Mutex.unlock mutex;
+                let msg = create_send msg in
+                send_msg sd msg
+              end;
           with End_of_file ->
             begin
               Format.printf
