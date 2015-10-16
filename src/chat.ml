@@ -95,8 +95,7 @@ let show_msg msg =
 let print_msg msg =
   pp_msg Format.std_formatter msg
 
-(* I stole these from rdr *)
-
+(* I stole these from rdr; binary/bytes marshalling, etc. *)
 let set_uint bytes integer size offset = 
   for i = 0 to (size - 1) do
     let byte = Char.chr @@ ((integer lsr (8 * i)) land 0xff) in
@@ -128,8 +127,9 @@ let msg_of_bytes bytes len =
     let contents = Bytes.sub bytes offset (len - offset) in
     {kind; contents}
 
-(* hand-crafted json, if real we'd use jsonm or another json lib, 
-  in addition to avoiding ^ string concat, and also appending the acc byte sequence more appropriately *)
+(* hand-crafted json, and msg header,
+   if real we'd use jsonm or another json lib,
+   in addition to avoiding ^ string concat, and also appending the acc byte sequence more appropriately *)
 let create_acc msg time =
   let json = Printf.sprintf "{acc: \"%s\", time: \"%f\"}" msg time in
   let length = Bytes.length json in
@@ -138,8 +138,7 @@ let create_acc msg time =
   header ^ json
 
 (* similar to above, there is a _much_ better way of doing this
-   (i.e., it's best to keep memory allocations as low as possible when sending),
-   but suffices for simple demo *)
+   (i.e., it's best to keep memory allocations as low as possible when sending), but suffices for simple demo *)
 let create_send msg =
   let length = Bytes.length msg in
   let b = Bytes.make (length + 9) '\000' in
@@ -238,7 +237,8 @@ let send_msg sd msg =
           "@[<v 4>@ SEND %d/%d@.@?@]" !current total
     done
 
-(* prints the acc wed received; checks sent message in the stack against acc value for debuggin *)
+(* prints the acc we received;
+  checks sent message in the stack against acc value for debugging *)
 let print_acc mutex accs msg =
   Mutex.lock mutex;
   let sentmsg = Stack.pop accs in
@@ -265,6 +265,8 @@ let send_acc sd current msg =
 (* this thread has two responsibilities:
    1. receives bytes and prints them to the console
    2. sends accs on message receipt
+
+   This will receive and print bytes even while sending huge chunks of data, i.e., it's async
  *)
 
 let recv_fn sd saddr mutex running accs =
@@ -350,7 +352,7 @@ let recv_fn sd saddr mutex running accs =
 
 (* 
    This send thread waits for user input, and then sends it.
-   Currently it polls stdin every 100 milliseconds to see if it should return.
+   Currently it polls stdin every 10 milliseconds to see if it should return.
    This allows the server to restart listening 
    and join this thread properly instead of waiting for a final user input,
    as well as rate-limits the cpu usage on thread scheduling

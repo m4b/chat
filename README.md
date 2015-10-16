@@ -1,2 +1,4 @@
 # chat
-Simple OCaml chat program
+Simple asynchronous OCaml chat client/server program.
+
+Enjoy.
