@@ -175,7 +175,7 @@ let empty_patch =
 let patch_msg msg ~sd ~count ~patch =
   patch.current <- patch.current + count;
   if (!debug) then Format.printf "@[<v 4>@ PATCH %d/%d@.@]" patch.current patch.total;
-  Buffer.add_bytes patch.buffer msg;
+  Buffer.add_bytes patch.buffer (Bytes.sub msg 0 count);
   patch.current >= patch.total
 
 (* *********************** *)
@@ -289,18 +289,19 @@ let recv_fn sd saddr mutex running accs =
               begin
                 if (!debug) then Format.printf "@[<v 4>@ PATCHING MESSAGE@.@?@]";
                 if (patch_msg buffer ~sd:sd ~count:count ~patch:!patch) then
+                  let msg = Bytes.sub (Buffer.to_bytes !patch.buffer) 0 !patch.total in
                   match !patch.kind with
                   | SEND ->
                      begin
                        if (!debug) then Format.printf "@[<v 4>@ PATCH SEND done %d/%d@.@]" !patch.current !patch.total;
                        patching_message := false;
-                       send_acc sd current_time (Buffer.to_bytes !patch.buffer)
+                       send_acc sd current_time msg
                      end
                   | ACC ->
                      begin
                        if (!debug) then Format.printf "@[<v 4>@ PATCH ACC done %d/%d@.@]" !patch.current !patch.total;
                        patching_message := false;
-                       print_acc mutex accs (Buffer.to_bytes !patch.buffer)
+                       print_acc mutex accs msg
                      end
               end
             else
