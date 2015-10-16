@@ -2,7 +2,7 @@
 ocamlbuild.native -tag thread -lib unix src/chat.native
 *)
 
-let version = "v1.0.2"
+let version = "v1.0.3"
 let kBUFFER_SIZE = 4096
 
 let debug = ref false
